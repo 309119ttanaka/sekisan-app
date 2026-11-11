@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>積算書生成アプリ</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- ExcelJS and FileSaver for Excel export with styling -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <!-- PDF.js for rendering PDF to image before sending to Gemini -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+        pdfjsLib.disableWorker = true;
+    </script>
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap');
+        body {
+            font-family: 'Inter', 'Noto Sans JP', sans-serif;
+            background-color: #ffffff;
+        }
+        
+        /* 印刷用の厳密な設定 */
+        @media print {
+            body * { visibility: hidden; }
+            #print-area, #print-area * { visibility: visible; }
+            #print-area { 
+                position: absolute; 
+                left: 0; 
+                top: 0; 
+                width: 100% !important;
+                height: auto !important;
+                background-color: white !important; 
+                padding: 0 !important;
+                margin: 0 !important; 
+                border: none !important; 
+                box-shadow: none !important; 
+                max-width: 100% !important;
+                aspect-ratio: auto !important;
+            }
+            .no-print { display: none !important; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { border: 1px solid #374151; padding: 4px 8px; font-size: 12pt; }
+            th { background-color: #ffffff; text-align: center; }
+        }
+        
+        .loader {
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-top: 3px solid #ffffff;
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .min-w-col {
+            width: 1%;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // =========================================================================
+        // 中継サーバー（Google Apps Script）のURL
+        // =========================================================================
+        const GAS_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxRI5Lvinew-Vlhp9732RL2hcnSkDP4QLF9AtxdX5gtIRyD1mWI0SgKVi9vmzWnIxom6w/exec"; 
+
+        const { useState, useRef, useEffect, useMemo } = React;
+
+        // Excel列番号（1, 2, ...）を列アルファベット（A, B, ... Z, AA...）に変換する関数
+        const getColumnLetter = (colIndex) => {
+            let temp, letter = '';
+            while (colIndex > 0) {
+                temp = (colIndex - 1) % 26;
+                letter = String.fromCharCode(temp + 65) + letter;
+                colIndex = (colIndex - temp - 1) / 26;
+            }
+            return letter;
+        };
+
+        function App() {
+            const [file, setFile] = useState(null);
+            const [previewData, setPreviewData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [errorDetails, setErrorDetails] = useState(null);
+            const [isDragging, setIsDragging] = useState(false);
+            const [useBesshi, setUseBesshi] = useState(false);
+            const [printOrientation, setPrintOrientation] = useState(() => {
+                return localStorage.getItem('sekisanOrientation') || 'landscape';
+            });
+            const [templateData, setTemplateData] = useState(null);
+            const [taxRate, setTaxRate] = useState(() => {
+                return localStorage.getItem('sekisanTaxRate') || '10';
+            });
+            
+            const fileInputRef = useRef(null);
+            const templateInputRef = useRef(null);
+
+            useEffect(() => {
+                const savedTemplate = localStorage.getItem('sekisanTemplate');
+                if (savedTemplate) {
+                    try {
+                        setTemplateData(JSON.parse(savedTemplate));
+                    } catch(e) {
+                        console.error("様式データの読み込みに失敗", e);
+                    }
+                }
+            }, []);
+
+            useEffect(() => {
+                localStorage.setItem('sekisanOrientation', printOrientation);
+            }, [printOrientation]);
+
+            useEffect(() => {
+                localStorage.setItem('sekisanTaxRate', taxRate);
+            }, [taxRate]);
+
+            const hasBikouData = useMemo(() => {
+                if (!previewData) return false;
+                const bikouIdx = previewData.headers.indexOf('備考');
+                if (bikouIdx === -1) return false;
+                return previewData.rows.some(r => r[bikouIdx] && String(r[bikouIdx]).trim() !== '');
+            }, [previewData]);
+
+            // 高解像度を保ちつつ通信量を最適化するPDFレンダラー
+            const convertPdfToImage = async (file) => {
+                return new Promise((resolve, reject) => {
+                    const timeoutId = setTimeout(() => {
+                        reject(new Error("PDFの展開に時間がかかりすぎました。"));
+                    }, 20000);
+
+                    file.arrayBuffer().then(arrayBuffer => {
+                        return pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                    }).then(pdf => {
+                        return pdf.getPage(1);
+                    }).then(page => {
+                        const viewport = page.getViewport({ scale: 1.2 }); 
+                        const canvas = document.createElement('canvas');
+                        const context = canvas.getContext('2d');
+                        canvas.height = viewport.height;
+                        canvas.width = viewport.width;
+
+                        return page.render({ canvasContext: context, viewport: viewport }).promise.then(() => {
+                            clearTimeout(timeoutId);
+                            resolve(canvas.toDataURL('image/jpeg', 0.8));
+                        });
+                    }).catch(err => {
+                        clearTimeout(timeoutId);
+                        reject(new Error("PDFの読み込みに失敗しました。画像ファイル（PNG/JPG）でお試しください。"));
+                    });
+                });
+            };
+
+            const readFileAsBase64 = (file) => {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = error => reject(error);
+                    reader.readAsDataURL(file);
+                });
+            };
+
+            const handleFileChange = (e) => {
+                handleFileSelection(e.target.files[0]);
+            };
+
+            const handleFileSelection = (selectedFile) => {
+                if (selectedFile) {
+                    setFile(selectedFile);
+                    setPreviewData(null);
+                    setErrorDetails(null);
+                }
+            };
+
+            const handleTemplateChange = async (e) => {
+                const selectedFile = e.target.files[0];
+                if (!selectedFile) return;
+                
+                try {
+                    let base64Data = "";
+                    let mimeType = 'image/jpeg';
+                    if (selectedFile.type === 'application/pdf') {
+                        base64Data = await convertPdfToImage(selectedFile);
+                    } else if (selectedFile.type.startsWith('image/')) {
+                        base64Data = await readFileAsBase64(selectedFile);
+                        mimeType = selectedFile.type;
+                    } else {
+                        setErrorDetails({
+                            title: "ファイル形式エラー",
+                            message: "PDFまたは画像ファイルを選択してください。"
+                        });
+                        return;
+                    }
+                    
+                    const dataToSave = { name: selectedFile.name, mimeType: mimeType, data: base64Data };
+                    localStorage.setItem('sekisanTemplate', JSON.stringify(dataToSave));
+                    setTemplateData(dataToSave);
+                } catch(err) {
+                    setErrorDetails({
+                        title: "読み込みエラー",
+                        message: err.message
+                    });
+                }
+            };
+
+            const clearTemplate = () => {
+                localStorage.removeItem('sekisanTemplate');
+                setTemplateData(null);
+            };
+
+            const handleDragOver = (e) => { e.preventDefault(); setIsDragging(true); };
+            const handleDragLeave = (e) => { e.preventDefault(); setIsDragging(false); };
+            const handleDrop = (e) => {
+                e.preventDefault(); setIsDragging(false);
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    handleFileSelection(e.dataTransfer.files[0]);
+                    e.dataTransfer.clearData();
+                }
+            };
+
+            const handleAnalyze = async () => {
+                if (!file) return;
+
+                if (!GAS_WEB_APP_URL || GAS_WEB_APP_URL.trim() === "") {
+                    setErrorDetails({
+                        title: "設定エラー",
+                        message: "中継サーバー（GAS）のURLが設定されていません。",
+                        hint: "HTMLファイル上部の GAS_WEB_APP_URL を確認してください。"
+                    });
+                    return;
+                }
+
+                setLoading(true);
+                setErrorDetails(null);
+                setPreviewData(null);
+
+                try {
+                    let base64Data = "";
+                    let mimeType = file.type;
+                    
+                    if (file.type === 'application/pdf') {
+                        base64Data = await convertPdfToImage(file);
+                        mimeType = 'image/jpeg';
+                    } else if (file.type.startsWith('image/')) {
+                        base64Data = await readFileAsBase64(file);
+                    } else {
+                        throw new Error("PDFまたは画像ファイルを選択してください。");
+                    }
+
+                    const base64String = base64Data.split(',')[1];
+
+                    const jsonExample = templateData ? `{
+  "headers": ["項目", "仕様", "数量", "単位", "単価", "金額", "備考"], 
+  "rows": [
+    ["重機使用料", "", "1", "式", "126,000", "126,000", ""]
+  ],
+  "summary": [
+    { "label": "小計", "value": "297,000" },
+    { "label": "消費税", "value": "29,700" },
+    { "label": "積算額", "value": "326,700" }
+  ]
+}` : `{
+  "headers": ["項目", "摘要", "数量", "単価", "金額", "備考"], 
+  "rows": [
+    ["重機使用料", "", "1式", "126,000", "126,000", ""]
+  ],
+  "summary": [
+    { "label": "小計", "value": "297,000" },
+    { "label": "消費税及び地方消費税の額", "value": "29,700" },
+    { "label": "積算額", "value": "326,700" }
+  ]
+}`;
+
+                    const systemInstructionText = `
+あなたはプロの積算担当者です。提供された業者からの見積書（画像）を分析し、指示されたフォーマットの積算書データを抽出・生成してください。
+以下の厳格なルールに従ってください。
+1. 項目名は勝手に変更せず、見積書にある表現をそのまま使用すること。
+${templateData ? '2. 【積算書の様式】画像が提供されています。この様式の表のカラム構成（ヘッダー項目）を完全に読み取り、それに合致するようにデータを出力してください。（例：「数量」「単位」が分かれていれば2列に分ける。「摘要」ではなく「仕様」となっていれば「仕様」とするなど）' : '2. データ構造は 項目, 摘要, 数量, 単価, 金額, 備考 の標準的なカラム構成とすること。'}
+3. 数量欄には、数値だけでなく単位も含めた文字列（例: "1式", "10m" など）を含めること（ただし、様式で「数量」と「単位」が別カラムになっている場合はそれぞれの列に分けること）。
+4. ★重要★ 単価が空欄、または記載されていない場合は、「金額 ÷ 数量の数値」で計算して単価を補完すること。
+5. ★重要★ 消費税の金額は、元の見積書の記載内容に関わらず、必ず「小計の${taxRate}%」で再計算した金額を出力すること。合計（積算額）もその消費税額を足した金額にすること。
+   その際、サマリー行（小計、消費税、合計など）の項目名は、提供された【積算書の様式】画像に記載されている名前（「消費税」や「積算額」など）を優先して使用すること。
+   様式画像が提供されていない場合のデフォルトは「小計」「消費税及び地方消費税の額」「積算額」とすること。
+6. ★超重要（不要な見出し行の除外）★ 見積書の表内に「〇〇内訳」「〇〇業務」など、数量・単価・金額の記載がないタイトル行・区分見出し行がある場合は、明細行（rows）に含めず完全に除外（無視）すること。実際に数量や金額が発生している品目・工種のみを明細行として抽出すること。
+7. ★重要★ 出力は必ず以下の形式のJSONデータのみを返してください。マークダウン(バッククォートなど)を含めず、JSONテキストのみを出力すること。
+
+${jsonExample}
+`;
+
+                    const parts = [
+                        { text: systemInstructionText },
+                        { text: "【見積書の画像】" },
+                        { inlineData: { mimeType: mimeType, data: base64String } }
+                    ];
+
+                    if (templateData) {
+                        parts.push({ text: "【積算書の様式】この様式に合わせてカラムを出力してください。" });
+                        parts.push({ inlineData: { mimeType: templateData.mimeType, data: templateData.data.split(',')[1] } });
+                    }
+
+                    const payload = {
+                        contents: [{ role: "user", parts: parts }],
+                        generationConfig: { 
+                            responseMimeType: "application/json"
+                        }
+                    };
+
+                    const candidateModels = ["gemini-3.8-flash", "gemini-3-flash-preview"];
+                    let success = false;
+
+                    for (let mIdx = 0; mIdx < candidateModels.length && !success; mIdx++) {
+                        let currentModel = candidateModels[mIdx];
+                        const proxyPayload = { model: currentModel, geminiPayload: payload };
+                        
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 75000);
+
+                        let response;
+                        try {
+                            response = await fetch(GAS_WEB_APP_URL, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'text/plain' },
+                                body: JSON.stringify(proxyPayload),
+                                signal: controller.signal
+                            });
+                        } catch (fetchErr) {
+                            clearTimeout(timeoutId);
+                            if (fetchErr.name === 'AbortError' && mIdx < candidateModels.length - 1) {
+                                console.warn(`モデル ${currentModel} がタイムアウトしたため、次のモデルに切り替えます。`);
+                                continue;
+                            }
+                            if (fetchErr.name === 'AbortError') {
+                                throw {
+                                    title: "応答タイムアウト",
+                                    message: "AIサーバーの応答に時間がかかりました。",
+                                    hint: "もう一度「積算書を生成する」を押してお試しください。"
+                                };
+                            }
+                            throw fetchErr;
+                        }
+                        clearTimeout(timeoutId);
+
+                        if (!response.ok) {
+                            if (mIdx < candidateModels.length - 1) continue;
+                            throw {
+                                title: "通信エラー",
+                                message: `HTTP ${response.status} ${response.statusText}`,
+                                hint: "ネットワーク接続または中継サーバー（GAS）の状態を確認してください。"
+                            };
+                        }
+
+                        const resultText = await response.text();
+
+                        if (resultText.trim().startsWith("<!DOCTYPE html>")) {
+                            throw {
+                                title: "認証・アクセス権エラー",
+                                message: "Googleのログイン画面が返却されました。",
+                                hint: "GASのデプロイ設定で「アクセスできるユーザー」が『全員』になっているかご確認ください。"
+                            };
+                        }
+
+                        let resultJson;
+                        try {
+                            resultJson = JSON.parse(resultText);
+                        } catch(e) {
+                            if (mIdx < candidateModels.length - 1) continue;
+                            throw {
+                                title: "応答データ不正",
+                                message: "サーバーからの返答がJSON形式ではありませんでした。",
+                                raw: resultText.substring(0, 150)
+                            };
+                        }
+
+                        if (resultJson.error) {
+                            const err = resultJson.error;
+                            const code = err.code || "不明";
+                            const msg = err.message || "";
+                            const status = err.status || "";
+
+                            if ((code === 404 || msg.includes("not found") || msg.includes("no longer available")) && mIdx < candidateModels.length - 1) {
+                                continue;
+                            }
+
+                            if (code === 429 || status === "RESOURCE_EXHAUSTED" || msg.includes("quota") || msg.includes("rate limit")) {
+                                throw {
+                                    title: "一時的な利用制限",
+                                    message: "短時間にリクエストが集中したため、APIの無料枠制限に達しました。",
+                                    hint: "約1分ほど待ってから再度お試しください。"
+                                };
+                            }
+
+                            if (code === 503 || msg.includes("overloaded")) {
+                                if (mIdx < candidateModels.length - 1) continue;
+                                throw {
+                                    title: "Googleサーバー混雑中",
+                                    message: "AIが一時的に混み合っています。少し時間をおいて再度お試しください。"
+                                };
+                            }
+
+                            if (code === 400 && msg.includes("API_KEY_INVALID")) {
+                                throw {
+                                    title: "APIキー無効エラー",
+                                    message: "登録されたGemini APIキーが無効です。",
+                                    hint: "GASのコードに貼り付けたAPIキーをご確認ください。"
+                                };
+                            }
+
+                            if (mIdx < candidateModels.length - 1) continue;
+
+                            throw {
+                                title: `Google APIエラー (${code})`,
+                                message: msg || status || "APIリクエストが拒否されました。",
+                                hint: "時間をおいて再度お試しください。"
+                            };
+                        }
+
+                        if (resultJson.candidates && resultJson.candidates.length > 0 && resultJson.candidates[0].content) {
+                            let jsonText = resultJson.candidates[0].content.parts[0].text;
+                            jsonText = jsonText.replace(/^```(json)?|```$/gm, '').trim();
+                            
+                            const data = JSON.parse(jsonText);
+                            if (!data.headers || !data.rows || !data.summary) {
+                                throw {
+                                    title: "データ形式不整合",
+                                    message: "AIが生成したデータの表形式が一致しませんでした。",
+                                    hint: "もう一度「積算書を生成する」を押してください。"
+                                };
+                            }
+
+                            // 二重チェック安全策：数量・単価・金額のすべてが空欄の見出し行・タイトル行を確実に除外
+                            const kingakuColIdx = data.headers.indexOf('金額');
+                            const tankaColIdx = data.headers.indexOf('単価');
+                            const suryoColIdx = data.headers.indexOf('数量');
+
+                            const filteredRows = data.rows.filter(row => {
+                                const kVal = kingakuColIdx !== -1 && row[kingakuColIdx] ? String(row[kingakuColIdx]).trim() : '';
+                                const tVal = tankaColIdx !== -1 && row[tankaColIdx] ? String(row[tankaColIdx]).trim() : '';
+                                const sVal = suryoColIdx !== -1 && row[suryoColIdx] ? String(row[suryoColIdx]).trim() : '';
+                                return kVal !== '' || tVal !== '' || sVal !== '';
+                            });
+
+                            setPreviewData({ headers: data.headers, rows: filteredRows, summary: data.summary });
+                            success = true;
+                        } else {
+                            if (mIdx < candidateModels.length - 1) continue;
+                            throw {
+                                title: "応答内容が空です",
+                                message: "AIからの返答が得られませんでした。画像が不鮮明な可能性があります。"
+                            };
+                        }
+                    }
+
+                } catch (err) {
+                    console.error("生成エラー詳細:", err);
+                    if (err.title) {
+                        setErrorDetails(err);
+                    } else {
+                        setErrorDetails({
+                            title: "エラーが発生しました",
+                            message: err.message || "予期しないエラーが発生しました。",
+                            hint: "時間をおいて再試行してください。"
+                        });
+                    }
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleExportExcel = async () => { 
+                if (!previewData) return;
+                
+                const wb = new ExcelJS.Workbook();
+                const ws = wb.addWorksheet("積算書");
+                
+                ws.pageSetup = {
+                    orientation: printOrientation,
+                    fitToPage: true,
+                    fitToWidth: 1,
+                    fitToHeight: 1,
+                    horizontalCentered: true, 
+                    margins: { left: 0.5, right: 0.5, top: 0.5, bottom: 0.5, header: 0.3, footer: 0.3 }
+                };
+
+                const suryoIdx = previewData.headers.indexOf('数量');
+                const suryoSeparated = previewData.headers.includes('単位');
+                const baseKingakuIdx = previewData.headers.indexOf("金額") !== -1 ? previewData.headers.indexOf("金額") : previewData.headers.length - 2;
+
+                let colMap = {};
+                let tempExCol = 1;
+                previewData.headers.forEach((h) => {
+                    colMap[h] = tempExCol;
+                    if (h === '数量' && !suryoSeparated) {
+                        tempExCol += 2;
+                    } else {
+                        tempExCol += 1;
+                    }
+                });
+                const suryoLetter = colMap['数量'] ? getColumnLetter(colMap['数量']) : null;
+                const tankaLetter = colMap['単価'] ? getColumnLetter(colMap['単価']) : null;
+
+                let excelCols = [];
+                previewData.headers.forEach((h, i) => {
+                    if (h === '数量' && !suryoSeparated) {
+                        excelCols.push({ width: 8 }); 
+                        excelCols.push({ width: 6 }); 
+                    } else if (h === '数量' || h === '単位') {
+                        excelCols.push({ width: 8 });
+                    } else if (['単価', '金額'].includes(h)) {
+                        excelCols.push({ width: 15 });
+                    } else if (h === '項目') {
+                        excelCols.push({ width: hasBikouData ? 22 : 28 });
+                    } else if (h === '備考') {
+                        excelCols.push({ width: hasBikouData ? 22 : 10 });
+                    } else {
+                        excelCols.push({ width: 32 });
+                    }
+                });
+                ws.columns = excelCols;
+                const colCount = excelCols.length;
+
+                let currentRow = 1;
+
+                if (useBesshi) {
+                    const cell = ws.getCell(currentRow, colCount);
+                    cell.value = "別紙";
+                    cell.alignment = { horizontal: 'right' };
+                    currentRow += 2;
+                } else {
+                    currentRow += 1;
+                }
+
+                ws.mergeCells(currentRow, 1, currentRow, colCount);
+                const titleCell = ws.getCell(currentRow, 1);
+                titleCell.value = "積算書";
+                titleCell.font = { size: 16, bold: true };
+                titleCell.alignment = { horizontal: 'center' };
+                currentRow += 2; 
+
+                const headerRow = ws.getRow(currentRow);
+                let exColIdx = 1;
+                previewData.headers.forEach((h, i) => {
+                    const cell = headerRow.getCell(exColIdx);
+                    cell.value = h;
+                    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+                    cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+                    
+                    if (h === '数量' && !suryoSeparated) {
+                        ws.mergeCells(currentRow, exColIdx, currentRow, exColIdx + 1);
+                        headerRow.getCell(exColIdx + 1).border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+                        exColIdx += 2;
+                    } else {
+                        exColIdx += 1;
+                    }
+                });
+                currentRow++;
+
+                const detailStartRow = currentRow;
+
+                previewData.rows.forEach(r => {
+                    const row = ws.getRow(currentRow);
+                    let exColIdx = 1;
+                    
+                    r.forEach((c, i) => {
+                        const header = previewData.headers[i];
+                        
+                        if (header === '数量' && !suryoSeparated) {
+                            const match = String(c).trim().match(/^([0-9,.]+)(.*)$/);
+                            let numPart = c;
+                            let unitPart = "";
+                            if (match) {
+                                numPart = Number(match[1].replace(/,/g, ''));
+                                if (isNaN(numPart)) numPart = match[1];
+                                unitPart = match[2].trim();
+                            }
+                            
+                            const numCell = row.getCell(exColIdx);
+                            numCell.value = numPart;
+                            numCell.numFmt = '#,##0.###';
+                            numCell.alignment = { horizontal: 'right', vertical: 'middle' };
+                            numCell.border = { top: { style: 'thin' }, bottom: { style: 'thin' }, left: { style: 'thin' }, right: { style: 'none' } };
+                            
+                            const unitCell = row.getCell(exColIdx + 1);
+                            unitCell.value = unitPart;
+                            unitCell.alignment = { horizontal: 'left', vertical: 'middle' };
+                            unitCell.border = { top: { style: 'thin' }, bottom: { style: 'thin' }, left: { style: 'none' }, right: { style: 'thin' } };
+
+                            exColIdx += 2;
+                        } else {
+                            const cell = row.getCell(exColIdx);
+                            if (header === '金額') {
+                                const num = Number(String(c).replace(/,/g, ''));
+                                const parsedNum = isNaN(num) || String(c).trim() === "" ? 0 : num;
+
+                                if (suryoLetter && tankaLetter) {
+                                    cell.value = {
+                                        formula: `IF(${tankaLetter}${currentRow}="","",${suryoLetter}${currentRow}*${tankaLetter}${currentRow})`,
+                                        result: parsedNum
+                                    };
+                                } else {
+                                    cell.value = parsedNum;
+                                }
+                                cell.numFmt = '#,##0';
+                                cell.alignment = { horizontal: 'right', vertical: 'middle' };
+                            } else if (['単価', '数量'].includes(header)) {
+                                const num = Number(String(c).replace(/,/g, ''));
+                                cell.value = isNaN(num) || String(c).trim() === "" ? c : num;
+                                cell.numFmt = '#,##0.###';
+                                cell.alignment = { horizontal: 'right', vertical: 'middle' };
+                            } else {
+                                cell.value = c;
+                                cell.alignment = { horizontal: (header === '単位' ? 'center' : 'left'), vertical: 'middle', wrapText: true };
+                            }
+                            cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+                            exColIdx += 1;
+                        }
+                    });
+                    currentRow++;
+                });
+
+                const detailEndRow = currentRow - 1;
+
+                let excelKingakuCol = baseKingakuIdx + 1;
+                if (!suryoSeparated && suryoIdx !== -1 && suryoIdx < baseKingakuIdx) {
+                    excelKingakuCol += 1;
+                }
+
+                const kingakuLetter = getColumnLetter(excelKingakuCol);
+                const currentTaxRateDecimal = (Number(taxRate) || 10) / 100;
+
+                let shokeiRowIdx = null;
+                let taxRowIdx = null;
+
+                previewData.summary.forEach(s => {
+                    if (baseKingakuIdx > 0) {
+                        ws.mergeCells(currentRow, 1, currentRow, excelKingakuCol - 1);
+                        const labelCell = ws.getCell(currentRow, 1);
+                        labelCell.value = s.label;
+                        labelCell.alignment = { horizontal: 'center', vertical: 'middle' };
+                        
+                        for (let i = 1; i <= excelKingakuCol - 1; i++) {
+                            ws.getCell(currentRow, i).border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+                        }
+
+                        const valCell = ws.getCell(currentRow, excelKingakuCol);
+                        const num = Number(String(s.value).replace(/,/g, ''));
+                        const parsedNum = isNaN(num) || String(s.value).trim() === "" ? 0 : num;
+
+                        if (s.label.includes("小計")) {
+                            shokeiRowIdx = currentRow;
+                            valCell.value = {
+                                formula: `SUM(${kingakuLetter}${detailStartRow}:${kingakuLetter}${detailEndRow})`,
+                                result: parsedNum
+                            };
+                        } else if (s.label.includes("消費税") || s.label.includes("税")) {
+                            taxRowIdx = currentRow;
+                            const refRow = shokeiRowIdx || (currentRow - 1);
+                            valCell.value = {
+                                formula: `INT(${kingakuLetter}${refRow}*${currentTaxRateDecimal})`,
+                                result: parsedNum
+                            };
+                        } else if (s.label.includes("積算額") || s.label.includes("合計")) {
+                            if (shokeiRowIdx && taxRowIdx) {
+                                valCell.value = {
+                                    formula: `SUM(${kingakuLetter}${shokeiRowIdx}:${kingakuLetter}${taxRowIdx})`,
+                                    result: parsedNum
+                                };
+                            } else {
+                                valCell.value = {
+                                    formula: `${kingakuLetter}${currentRow - 2}+${kingakuLetter}${currentRow - 1}`,
+                                    result: parsedNum
+                                };
+                            }
+                        } else {
+                            valCell.value = parsedNum;
+                        }
+
+                        valCell.numFmt = '#,##0';
+                        valCell.alignment = { horizontal: 'right', vertical: 'middle' };
+                        valCell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+
+                        for (let i = excelKingakuCol + 1; i <= colCount; i++) {
+                            const emptyCell = ws.getCell(currentRow, i);
+                            emptyCell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+                        }
+                    }
+                    currentRow++;
+                });
+
+                const buffer = await wb.xlsx.writeBuffer();
+                saveAs(new Blob([buffer], { type: "application/octet-stream" }), "積算書.xlsx");
+            };
+
+            const handlePrint = () => {
+                const originalTitle = document.title;
+                document.title = "積算書";
+                window.print();
+                setTimeout(() => {
+                    document.title = originalTitle;
+                }, 100);
+            };
+
+            const getColClass = (h, isHeader = false) => {
+                let base = "border border-gray-700 px-3 py-2";
+                
+                if (isHeader) {
+                    base += " text-center whitespace-nowrap"; 
+                }
+                
+                if (['数量', '単位', '単価', '金額'].includes(h)) {
+                    return `${base} min-w-col`; 
+                } else if (['項目'].includes(h)) {
+                    return `${base} ${hasBikouData ? 'w-[20%]' : 'w-[28%]'}`;
+                } else if (h === '備考') {
+                    return `${base} ${hasBikouData ? 'w-[20%]' : 'w-[12%]'}`; 
+                } else {
+                    return `${base} w-auto`; 
+                }
+            };
+
+            const getAlignClass = (h) => {
+                if (['単位'].includes(h)) return "text-center";
+                if (['数量', '単価', '金額'].includes(h)) return "text-right";
+                return "text-left";
+            };
+
+            const kingakuIdx = previewData ? (previewData.headers.indexOf("金額") !== -1 ? previewData.headers.indexOf("金額") : previewData.headers.length - 2) : -1;
+
+            const previewContainerStyle = printOrientation === 'portrait'
+                ? { aspectRatio: '210/297', maxWidth: '800px' }
+                : { aspectRatio: '297/210', maxWidth: '1100px' };
+
+            return (
+                <div className="min-h-screen p-4 flex flex-col items-center">
+                    <header className="w-full max-w-6xl mb-4 text-center no-print">
+                        <h1 className="text-3xl font-bold text-gray-800">
+                            <i className="fa-solid fa-file-invoice-dollar text-blue-600 mr-3"></i>
+                            積算書生成アプリ
+                        </h1>
+                    </header>
+
+                    <main className="w-full max-w-[1400px] flex flex-col lg:flex-row gap-6">
+                        <div className="w-full lg:w-1/4 xl:w-[320px] shrink-0 flex flex-col gap-4 no-print">
+                            <div className="rounded-xl shadow-sm p-3 border border-gray-200 bg-white">
+                                <h2 className="text-sm font-semibold text-gray-700 mb-1">⚙️ 積算書様式（PDF）をアップロード（任意）</h2>
+                                <p className="text-[11px] text-gray-500 mb-2">※登録しない場合は、デフォルトの様式で作成されます。</p>
+                                {templateData ? (
+                                    <div className="bg-green-50 border border-green-200 rounded p-2 text-xs flex justify-between items-center">
+                                        <span className="text-green-700 font-medium truncate pr-2"><i className="fa-solid fa-check-circle mr-1"></i> {templateData.name}</span>
+                                        <button onClick={clearTemplate} className="text-red-500 hover:text-red-700 whitespace-nowrap">削除</button>
+                                    </div>
+                                ) : (
+                                    <div className="text-center">
+                                        <input type="file" ref={templateInputRef} className="hidden" accept="image/*,application/pdf" onChange={handleTemplateChange}/>
+                                        <button onClick={() => templateInputRef.current.click()} className="w-full py-1.5 bg-gray-50 hover:bg-gray-100 text-gray-700 text-xs rounded border border-gray-300 transition-colors">
+                                            様式ファイルを登録
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="rounded-xl shadow-sm p-4 border border-gray-200 bg-white">
+                                <h2 className="text-base font-semibold text-gray-700 mb-2">1. 見積書をアップロード</h2>
+                                <div className={`border-2 border-dashed rounded-lg p-4 text-center cursor-pointer transition-colors ${isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:bg-gray-50'}`} onClick={() => fileInputRef.current.click()} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+                                    <input type="file" ref={fileInputRef} className="hidden" accept="image/*,application/pdf" onChange={handleFileChange}/>
+                                    <i className={`fa-solid fa-cloud-arrow-up text-2xl mb-1 ${isDragging ? 'text-blue-500' : 'text-gray-400'}`}></i>
+                                    <p className={`font-medium text-sm ${isDragging ? 'text-blue-600' : 'text-gray-600'}`}>クリックまたはドラッグ＆ドロップ</p>
+                                </div>
+                                {file && (<div className="mt-3 p-2 bg-blue-50 border border-blue-100 rounded text-xs text-blue-700 break-all">{file.name}</div>)}
+                                
+                                <div className="mt-3 flex items-center justify-between bg-gray-50 p-2 rounded border border-gray-200">
+                                    <span className="text-xs font-medium text-gray-700">適用する消費税率</span>
+                                    <div className="flex items-center gap-1">
+                                        <input 
+                                            type="number" 
+                                            min="0" 
+                                            max="100" 
+                                            value={taxRate} 
+                                            onChange={(e) => setTaxRate(e.target.value)} 
+                                            className="w-14 p-1 text-right border border-gray-300 rounded text-xs outline-none focus:border-blue-500"
+                                        />
+                                        <span className="text-xs text-gray-600 font-medium">%</span>
+                                    </div>
+                                </div>
+
+                                <button 
+                                    onClick={handleAnalyze} 
+                                    disabled={!file || loading} 
+                                    className={`w-full mt-3 py-2 rounded font-semibold text-white text-sm transition-all shadow-sm flex justify-center items-center gap-2 ${(!file || loading) ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+                                >
+                                    {loading ? (
+                                        <><div className="loader"></div>AIが積算書データを生成中...</>
+                                    ) : (
+                                        <><i className="fa-solid fa-wand-magic-sparkles"></i>積算書を生成する</>
+                                    )}
+                                </button>
+
+                                {errorDetails && (
+                                    <div className="mt-3 p-3 bg-red-50 text-red-700 rounded-lg text-xs border border-red-200 leading-relaxed">
+                                        <div className="font-bold flex items-center gap-1.5 mb-1 text-red-800">
+                                            <i className="fa-solid fa-triangle-exclamation"></i>
+                                            {errorDetails.title}
+                                        </div>
+                                        <p className="mb-1">{errorDetails.message}</p>
+                                        {errorDetails.hint && (
+                                            <p className="text-[11px] text-gray-600 mt-1 pt-1 border-t border-red-100">
+                                                💡 {errorDetails.hint}
+                                            </p>
+                                        )}
+                                        {errorDetails.raw && (
+                                            <details className="mt-1">
+                                                <summary className="text-[10px] text-gray-500 cursor-pointer hover:underline">詳細ログ</summary>
+                                                <pre className="text-[10px] bg-white p-1 rounded border border-gray-200 mt-1 overflow-x-auto whitespace-pre-wrap">{errorDetails.raw}</pre>
+                                            </details>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
+                            {previewData && (
+                                <div className="rounded-xl shadow-sm p-4 border border-gray-200 bg-white">
+                                    <h2 className="text-base font-semibold text-gray-700 mb-2">2. 出力設定</h2>
+                                    
+                                    <div className="mb-3 space-y-2">
+                                        <label className="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox" checked={useBesshi} onChange={(e) => setUseBesshi(e.target.checked)} className="w-3.5 h-3.5 text-blue-600 rounded border-gray-300"/>
+                                            <span className="text-gray-700 font-medium text-xs">右上に「別紙」と表示する</span>
+                                        </label>
+                                        
+                                        <div>
+                                            <span className="text-gray-700 font-medium text-xs block mb-1">プレビューと印刷の向き:</span>
+                                            <div className="flex gap-3 p-1.5 bg-gray-50 rounded border border-gray-200">
+                                                <label className="flex items-center gap-1.5 cursor-pointer">
+                                                    <input type="radio" value="landscape" checked={printOrientation === 'landscape'} onChange={(e) => setPrintOrientation(e.target.value)} className="w-3.5 h-3.5 text-blue-600 border-gray-300"/>
+                                                    <span className="text-xs font-medium">横向き</span>
+                                                </label>
+                                                <label className="flex items-center gap-1.5 cursor-pointer">
+                                                    <input type="radio" value="portrait" checked={printOrientation === 'portrait'} onChange={(e) => setPrintOrientation(e.target.value)} className="w-3.5 h-3.5 text-blue-600 border-gray-300"/>
+                                                    <span className="text-xs font-medium">縦向き</span>
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex flex-col gap-2">
+                                        <button onClick={handlePrint} className="w-full py-2 bg-red-500 hover:bg-red-600 text-white text-sm rounded font-semibold shadow-sm transition-colors"><i className="fa-solid fa-file-pdf mr-2"></i>PDF出力（印刷）</button>
+                                        <button onClick={handleExportExcel} className="w-full py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded font-semibold shadow-sm transition-colors"><i className="fa-solid fa-file-excel mr-2"></i>Excel形式で保存</button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="w-full lg:flex-1 overflow-hidden">
+                            <div className="border-b border-gray-200 px-6 py-3 flex justify-between items-center no-print bg-white rounded-t-xl border-t border-l border-r shadow-sm">
+                                <h2 className="text-base font-semibold text-gray-700">印刷プレビュー</h2>
+                                {previewData && <span className="text-[11px] text-gray-500 bg-gray-100 px-2 py-1 rounded border border-gray-200">用紙設定: A4 {printOrientation === 'portrait' ? '縦' : '横'}</span>}
+                            </div>
+                            
+                            <div className="p-4 md:p-6 bg-white border-b border-l border-r border-gray-300 rounded-b-xl flex justify-center no-print-bg">
+                                {previewData ? (
+                                    <div 
+                                        id="print-area" 
+                                        className="bg-white shadow-sm border border-gray-200 mx-auto transition-all duration-300 px-8 py-10 md:px-12 md:py-12 w-full"
+                                        style={previewContainerStyle}
+                                    >
+                                        <style dangerouslySetInnerHTML={{__html: `
+                                            @media print {
+                                                @page { size: A4 ${printOrientation}; margin: 15mm; }
+                                            }
+                                        `}} />
+                                        {useBesshi && (
+                                            <>
+                                                <div className="text-right text-gray-800 font-medium mb-4">別紙</div>
+                                            </>
+                                        )}
+                                        
+                                        <h1 className="text-center text-xl font-bold tracking-widest">積算書</h1>
+                                        <div className="h-4 mb-2"></div>
+
+                                        <table className="w-full text-[13px] text-left border-collapse border border-gray-700">
+                                            <thead>
+                                                <tr>
+                                                    {previewData.headers.map((h, i) => (
+                                                        <th key={i} className={getColClass(h, true)}>
+                                                            {h}
+                                                        </th>
+                                                    ))}
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {previewData.rows.map((r, ri) => (
+                                                    <tr key={ri}>
+                                                        {r.map((c, ci) => (
+                                                            <td key={ci} className={`${getColClass(previewData.headers[ci], false)} ${getAlignClass(previewData.headers[ci])}`}>
+                                                                {c}
+                                                            </td>
+                                                        ))}
+                                                    </tr>
+                                                ))}
+                                                {previewData.summary.map((s, i) => (
+                                                    <tr key={`sum-${i}`}>
+                                                        <td colSpan={Math.max(1, kingakuIdx)} className="border border-gray-700 px-3 py-2 text-center font-medium">{s.label}</td>
+                                                        <td className="border border-gray-700 px-3 py-2 text-right font-medium min-w-col">{s.value}</td>
+                                                        {kingakuIdx < previewData.headers.length - 1 && (
+                                                            <td colSpan={previewData.headers.length - 1 - kingakuIdx} className="border border-gray-700 px-3 py-2"></td>
+                                                        )}
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                ) : (
+                                    <div className="h-full w-full bg-white flex flex-col items-center justify-center text-gray-400 min-h-[400px]">
+                                        <i className="fa-regular fa-file-lines text-4xl mb-3 text-gray-300"></i>
+                                        <p className="text-sm">ファイルを選択し、生成ボタンを押してください</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
