@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>積算書生成アプリ</title>
+    <title>積算書ジェネレーター</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- React & ReactDOM -->
@@ -83,7 +83,7 @@
 
         const { useState, useRef, useEffect, useMemo } = React;
 
-        // Excel列番号（1, 2, ...）を列アルファベット（A, B, ... Z, AA...）に変換する関数
+        // Excel列番号変換
         const getColumnLetter = (colIndex) => {
             let temp, letter = '';
             while (colIndex > 0) {
@@ -138,31 +138,33 @@
                 return previewData.rows.some(r => r[bikouIdx] && String(r[bikouIdx]).trim() !== '');
             }, [previewData]);
 
-            // 高解像度を保ちつつ通信量を最適化するPDFレンダラー
-            const convertPdfToImage = async (file) => {
+            // 高速化：解像度と画質を下げて軽量化
+            const convertPdfToImages = async (file) => {
                 return new Promise((resolve, reject) => {
                     const timeoutId = setTimeout(() => {
                         reject(new Error("PDFの展開に時間がかかりすぎました。"));
-                    }, 20000);
+                    }, 30000);
 
                     file.arrayBuffer().then(arrayBuffer => {
                         return pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-                    }).then(pdf => {
-                        return pdf.getPage(1);
-                    }).then(page => {
-                        const viewport = page.getViewport({ scale: 1.2 }); 
-                        const canvas = document.createElement('canvas');
-                        const context = canvas.getContext('2d');
-                        canvas.height = viewport.height;
-                        canvas.width = viewport.width;
-
-                        return page.render({ canvasContext: context, viewport: viewport }).promise.then(() => {
-                            clearTimeout(timeoutId);
-                            resolve(canvas.toDataURL('image/jpeg', 0.8));
-                        });
+                    }).then(async pdf => {
+                        const numPages = pdf.numPages;
+                        const images = [];
+                        for (let i = 1; i <= numPages; i++) {
+                            const page = await pdf.getPage(i);
+                            const viewport = page.getViewport({ scale: 1.0 }); 
+                            const canvas = document.createElement('canvas');
+                            const context = canvas.getContext('2d');
+                            canvas.height = viewport.height;
+                            canvas.width = viewport.width;
+                            await page.render({ canvasContext: context, viewport: viewport }).promise;
+                            images.push(canvas.toDataURL('image/jpeg', 0.5));
+                        }
+                        clearTimeout(timeoutId);
+                        resolve(images);
                     }).catch(err => {
                         clearTimeout(timeoutId);
-                        reject(new Error("PDFの読み込みに失敗しました。画像ファイル（PNG/JPG）でお試しください。"));
+                        reject(new Error("PDFの読み込みに失敗しました。画像ファイルでお試しください。"));
                     });
                 });
             };
@@ -196,7 +198,8 @@
                     let base64Data = "";
                     let mimeType = 'image/jpeg';
                     if (selectedFile.type === 'application/pdf') {
-                        base64Data = await convertPdfToImage(selectedFile);
+                        const images = await convertPdfToImages(selectedFile);
+                        base64Data = images[0];
                     } else if (selectedFile.type.startsWith('image/')) {
                         base64Data = await readFileAsBase64(selectedFile);
                         mimeType = selectedFile.type;
@@ -240,8 +243,7 @@
                 if (!GAS_WEB_APP_URL || GAS_WEB_APP_URL.trim() === "") {
                     setErrorDetails({
                         title: "設定エラー",
-                        message: "中継サーバー（GAS）のURLが設定されていません。",
-                        hint: "HTMLファイル上部の GAS_WEB_APP_URL を確認してください。"
+                        message: "中継サーバー（GAS）のURLが設定されていません。"
                     });
                     return;
                 }
@@ -251,19 +253,18 @@
                 setPreviewData(null);
 
                 try {
-                    let base64Data = "";
+                    let base64Images = [];
                     let mimeType = file.type;
                     
                     if (file.type === 'application/pdf') {
-                        base64Data = await convertPdfToImage(file);
+                        base64Images = await convertPdfToImages(file);
                         mimeType = 'image/jpeg';
                     } else if (file.type.startsWith('image/')) {
-                        base64Data = await readFileAsBase64(file);
+                        const b64 = await readFileAsBase64(file);
+                        base64Images = [b64];
                     } else {
                         throw new Error("PDFまたは画像ファイルを選択してください。");
                     }
-
-                    const base64String = base64Data.split(',')[1];
 
                     const jsonExample = templateData ? `{
   "headers": ["項目", "仕様", "数量", "単位", "単価", "金額", "備考"], 
@@ -289,25 +290,26 @@
 
                     const systemInstructionText = `
 あなたはプロの積算担当者です。提供された業者からの見積書（画像）を分析し、指示されたフォーマットの積算書データを抽出・生成してください。
-以下の厳格なルールに従ってください。
 1. 項目名は勝手に変更せず、見積書にある表現をそのまま使用すること。
-${templateData ? '2. 【積算書の様式】画像が提供されています。この様式の表のカラム構成（ヘッダー項目）を完全に読み取り、それに合致するようにデータを出力してください。（例：「数量」「単位」が分かれていれば2列に分ける。「摘要」ではなく「仕様」となっていれば「仕様」とするなど）' : '2. データ構造は 項目, 摘要, 数量, 単価, 金額, 備考 の標準的なカラム構成とすること。'}
-3. 数量欄には、数値だけでなく単位も含めた文字列（例: "1式", "10m" など）を含めること（ただし、様式で「数量」と「単位」が別カラムになっている場合はそれぞれの列に分けること）。
-4. ★重要★ 単価が空欄、または記載されていない場合は、「金額 ÷ 数量の数値」で計算して単価を補完すること。
-5. ★重要★ 消費税の金額は、元の見積書の記載内容に関わらず、必ず「小計の${taxRate}%」で再計算した金額を出力すること。合計（積算額）もその消費税額を足した金額にすること。
-   その際、サマリー行（小計、消費税、合計など）の項目名は、提供された【積算書の様式】画像に記載されている名前（「消費税」や「積算額」など）を優先して使用すること。
-   様式画像が提供されていない場合のデフォルトは「小計」「消費税及び地方消費税の額」「積算額」とすること。
-6. ★超重要（不要な見出し行の除外）★ 見積書の表内に「〇〇内訳」「〇〇業務」など、数量・単価・金額の記載がないタイトル行・区分見出し行がある場合は、明細行（rows）に含めず完全に除外（無視）すること。実際に数量や金額が発生している品目・工種のみを明細行として抽出すること。
-7. ★重要★ 出力は必ず以下の形式のJSONデータのみを返してください。マークダウン(バッククォートなど)を含めず、JSONテキストのみを出力すること。
+${templateData ? '2. 【積算書の様式】画像が提供されています。この様式の表のカラム構成（ヘッダー項目）を完全に読み取り、それに合致するようにデータを出力してください。' : '2. データ構造は 項目, 摘要, 数量, 単価, 金額, 備考 の標準的なカラム構成とすること。'}
+3. 数量欄には、数値だけでなく単位も含めた文字列を含めること（ただし、様式で「数量」と「単位」が別カラムになっている場合はそれぞれの列に分けること）。
+4. 単価が空欄、または記載されていない場合は、「金額 ÷ 数量の数値」で計算して単価を補完すること。
+5. 消費税の金額は、元の見積書の記載内容に関わらず、必ず「小計の${taxRate}%」で再計算した金額を出力すること。合計もそれに合わせること。
+6. 見積書の表内に「〇〇内訳」「〇〇業務」など、数量・単価・金額の記載がないタイトル行がある場合は、明細行（rows）に含めず除外すること。
+7. 出力は必ず以下の形式のJSONデータのみを返してください。
 
 ${jsonExample}
 `;
 
                     const parts = [
                         { text: systemInstructionText },
-                        { text: "【見積書の画像】" },
-                        { inlineData: { mimeType: mimeType, data: base64String } }
+                        { text: "【見積書の画像】" }
                     ];
+
+                    base64Images.forEach(base64Data => {
+                        const base64String = base64Data.split(',')[1];
+                        parts.push({ inlineData: { mimeType: mimeType, data: base64String } });
+                    });
 
                     if (templateData) {
                         parts.push({ text: "【積算書の様式】この様式に合わせてカラムを出力してください。" });
@@ -342,7 +344,6 @@ ${jsonExample}
                         } catch (fetchErr) {
                             clearTimeout(timeoutId);
                             if (fetchErr.name === 'AbortError' && mIdx < candidateModels.length - 1) {
-                                console.warn(`モデル ${currentModel} がタイムアウトしたため、次のモデルに切り替えます。`);
                                 continue;
                             }
                             if (fetchErr.name === 'AbortError') {
@@ -360,8 +361,7 @@ ${jsonExample}
                             if (mIdx < candidateModels.length - 1) continue;
                             throw {
                                 title: "通信エラー",
-                                message: `HTTP ${response.status} ${response.statusText}`,
-                                hint: "ネットワーク接続または中継サーバー（GAS）の状態を確認してください。"
+                                message: `HTTP ${response.status} ${response.statusText}`
                             };
                         }
 
@@ -369,9 +369,8 @@ ${jsonExample}
 
                         if (resultText.trim().startsWith("<!DOCTYPE html>")) {
                             throw {
-                                title: "認証・アクセス権エラー",
-                                message: "Googleのログイン画面が返却されました。",
-                                hint: "GASのデプロイ設定で「アクセスできるユーザー」が『全員』になっているかご確認ください。"
+                                title: "認証エラー",
+                                message: "Googleのログイン画面が返却されました。"
                             };
                         }
 
@@ -381,52 +380,27 @@ ${jsonExample}
                         } catch(e) {
                             if (mIdx < candidateModels.length - 1) continue;
                             throw {
-                                title: "応答データ不正",
-                                message: "サーバーからの返答がJSON形式ではありませんでした。",
-                                raw: resultText.substring(0, 150)
+                                title: "データエラー",
+                                message: "返答がJSONではありませんでした。"
                             };
                         }
 
                         if (resultJson.error) {
                             const err = resultJson.error;
                             const code = err.code || "不明";
-                            const msg = err.message || "";
-                            const status = err.status || "";
-
-                            if ((code === 404 || msg.includes("not found") || msg.includes("no longer available")) && mIdx < candidateModels.length - 1) {
-                                continue;
-                            }
-
-                            if (code === 429 || status === "RESOURCE_EXHAUSTED" || msg.includes("quota") || msg.includes("rate limit")) {
+                            
+                            if ((code === 404) && mIdx < candidateModels.length - 1) continue;
+                            if (code === 429) {
                                 throw {
-                                    title: "一時的な利用制限",
-                                    message: "短時間にリクエストが集中したため、APIの無料枠制限に達しました。",
-                                    hint: "約1分ほど待ってから再度お試しください。"
+                                    title: "利用制限",
+                                    message: "APIの無料枠制限に達しました。",
+                                    hint: "1分ほど待ってから再度お試しください。"
                                 };
                             }
-
-                            if (code === 503 || msg.includes("overloaded")) {
-                                if (mIdx < candidateModels.length - 1) continue;
-                                throw {
-                                    title: "Googleサーバー混雑中",
-                                    message: "AIが一時的に混み合っています。少し時間をおいて再度お試しください。"
-                                };
-                            }
-
-                            if (code === 400 && msg.includes("API_KEY_INVALID")) {
-                                throw {
-                                    title: "APIキー無効エラー",
-                                    message: "登録されたGemini APIキーが無効です。",
-                                    hint: "GASのコードに貼り付けたAPIキーをご確認ください。"
-                                };
-                            }
-
                             if (mIdx < candidateModels.length - 1) continue;
-
                             throw {
-                                title: `Google APIエラー (${code})`,
-                                message: msg || status || "APIリクエストが拒否されました。",
-                                hint: "時間をおいて再度お試しください。"
+                                title: `APIエラー (${code})`,
+                                message: err.message || "エラーが発生しました。"
                             };
                         }
 
@@ -436,14 +410,9 @@ ${jsonExample}
                             
                             const data = JSON.parse(jsonText);
                             if (!data.headers || !data.rows || !data.summary) {
-                                throw {
-                                    title: "データ形式不整合",
-                                    message: "AIが生成したデータの表形式が一致しませんでした。",
-                                    hint: "もう一度「積算書を生成する」を押してください。"
-                                };
+                                throw { title: "データ形式エラー", message: "形式が一致しませんでした。" };
                             }
 
-                            // 二重チェック安全策：数量・単価・金額のすべてが空欄の見出し行・タイトル行を確実に除外
                             const kingakuColIdx = data.headers.indexOf('金額');
                             const tankaColIdx = data.headers.indexOf('単価');
                             const suryoColIdx = data.headers.indexOf('数量');
@@ -459,24 +428,11 @@ ${jsonExample}
                             success = true;
                         } else {
                             if (mIdx < candidateModels.length - 1) continue;
-                            throw {
-                                title: "応答内容が空です",
-                                message: "AIからの返答が得られませんでした。画像が不鮮明な可能性があります。"
-                            };
+                            throw { title: "応答が空です", message: "AIから結果が返りませんでした。" };
                         }
                     }
-
                 } catch (err) {
-                    console.error("生成エラー詳細:", err);
-                    if (err.title) {
-                        setErrorDetails(err);
-                    } else {
-                        setErrorDetails({
-                            title: "エラーが発生しました",
-                            message: err.message || "予期しないエラーが発生しました。",
-                            hint: "時間をおいて再試行してください。"
-                        });
-                    }
+                    setErrorDetails(err.title ? err : { title: "エラー", message: err.message });
                 } finally {
                     setLoading(false);
                 }
@@ -717,20 +673,11 @@ ${jsonExample}
 
             const getColClass = (h, isHeader = false) => {
                 let base = "border border-gray-700 px-3 py-2";
-                
-                if (isHeader) {
-                    base += " text-center whitespace-nowrap"; 
-                }
-                
-                if (['数量', '単位', '単価', '金額'].includes(h)) {
-                    return `${base} min-w-col`; 
-                } else if (['項目'].includes(h)) {
-                    return `${base} ${hasBikouData ? 'w-[20%]' : 'w-[28%]'}`;
-                } else if (h === '備考') {
-                    return `${base} ${hasBikouData ? 'w-[20%]' : 'w-[12%]'}`; 
-                } else {
-                    return `${base} w-auto`; 
-                }
+                if (isHeader) base += " text-center whitespace-nowrap"; 
+                if (['数量', '単位', '単価', '金額'].includes(h)) return `${base} min-w-col`; 
+                if (['項目'].includes(h)) return `${base} ${hasBikouData ? 'w-[20%]' : 'w-[28%]'}`;
+                if (h === '備考') return `${base} ${hasBikouData ? 'w-[20%]' : 'w-[12%]'}`; 
+                return `${base} w-auto`; 
             };
 
             const getAlignClass = (h) => {
@@ -750,7 +697,7 @@ ${jsonExample}
                     <header className="w-full max-w-6xl mb-4 text-center no-print">
                         <h1 className="text-3xl font-bold text-gray-800">
                             <i className="fa-solid fa-file-invoice-dollar text-blue-600 mr-3"></i>
-                            積算書生成アプリ
+                            積算書ジェネレーター
                         </h1>
                     </header>
 
@@ -787,11 +734,7 @@ ${jsonExample}
                                     <span className="text-xs font-medium text-gray-700">適用する消費税率</span>
                                     <div className="flex items-center gap-1">
                                         <input 
-                                            type="number" 
-                                            min="0" 
-                                            max="100" 
-                                            value={taxRate} 
-                                            onChange={(e) => setTaxRate(e.target.value)} 
+                                            type="number" min="0" max="100" value={taxRate} onChange={(e) => setTaxRate(e.target.value)} 
                                             className="w-14 p-1 text-right border border-gray-300 rounded text-xs outline-none focus:border-blue-500"
                                         />
                                         <span className="text-xs text-gray-600 font-medium">%</span>
@@ -817,17 +760,7 @@ ${jsonExample}
                                             {errorDetails.title}
                                         </div>
                                         <p className="mb-1">{errorDetails.message}</p>
-                                        {errorDetails.hint && (
-                                            <p className="text-[11px] text-gray-600 mt-1 pt-1 border-t border-red-100">
-                                                💡 {errorDetails.hint}
-                                            </p>
-                                        )}
-                                        {errorDetails.raw && (
-                                            <details className="mt-1">
-                                                <summary className="text-[10px] text-gray-500 cursor-pointer hover:underline">詳細ログ</summary>
-                                                <pre className="text-[10px] bg-white p-1 rounded border border-gray-200 mt-1 overflow-x-auto whitespace-pre-wrap">{errorDetails.raw}</pre>
-                                            </details>
-                                        )}
+                                        {errorDetails.hint && <p className="text-[11px] text-gray-600 mt-1 pt-1 border-t border-red-100">💡 {errorDetails.hint}</p>}
                                     </div>
                                 )}
                             </div>
@@ -835,13 +768,11 @@ ${jsonExample}
                             {previewData && (
                                 <div className="rounded-xl shadow-sm p-4 border border-gray-200 bg-white">
                                     <h2 className="text-base font-semibold text-gray-700 mb-2">2. 出力設定</h2>
-                                    
                                     <div className="mb-3 space-y-2">
                                         <label className="flex items-center gap-2 cursor-pointer">
                                             <input type="checkbox" checked={useBesshi} onChange={(e) => setUseBesshi(e.target.checked)} className="w-3.5 h-3.5 text-blue-600 rounded border-gray-300"/>
                                             <span className="text-gray-700 font-medium text-xs">右上に「別紙」と表示する</span>
                                         </label>
-                                        
                                         <div>
                                             <span className="text-gray-700 font-medium text-xs block mb-1">プレビューと印刷の向き:</span>
                                             <div className="flex gap-3 p-1.5 bg-gray-50 rounded border border-gray-200">
@@ -856,7 +787,6 @@ ${jsonExample}
                                             </div>
                                         </div>
                                     </div>
-
                                     <div className="flex flex-col gap-2">
                                         <button onClick={handlePrint} className="w-full py-2 bg-red-500 hover:bg-red-600 text-white text-sm rounded font-semibold shadow-sm transition-colors"><i className="fa-solid fa-file-pdf mr-2"></i>PDF出力（印刷）</button>
                                         <button onClick={handleExportExcel} className="w-full py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded font-semibold shadow-sm transition-colors"><i className="fa-solid fa-file-excel mr-2"></i>Excel形式で保存</button>
@@ -878,27 +808,15 @@ ${jsonExample}
                                         className="bg-white shadow-sm border border-gray-200 mx-auto transition-all duration-300 px-8 py-10 md:px-12 md:py-12 w-full"
                                         style={previewContainerStyle}
                                     >
-                                        <style dangerouslySetInnerHTML={{__html: `
-                                            @media print {
-                                                @page { size: A4 ${printOrientation}; margin: 15mm; }
-                                            }
-                                        `}} />
-                                        {useBesshi && (
-                                            <>
-                                                <div className="text-right text-gray-800 font-medium mb-4">別紙</div>
-                                            </>
-                                        )}
-                                        
+                                        <style dangerouslySetInnerHTML={{__html: `@media print { @page { size: A4 ${printOrientation}; margin: 15mm; } }`}} />
+                                        {useBesshi && <div className="text-right text-gray-800 font-medium mb-4">別紙</div>}
                                         <h1 className="text-center text-xl font-bold tracking-widest">積算書</h1>
                                         <div className="h-4 mb-2"></div>
-
                                         <table className="w-full text-[13px] text-left border-collapse border border-gray-700">
                                             <thead>
                                                 <tr>
                                                     {previewData.headers.map((h, i) => (
-                                                        <th key={i} className={getColClass(h, true)}>
-                                                            {h}
-                                                        </th>
+                                                        <th key={i} className={getColClass(h, true)}>{h}</th>
                                                     ))}
                                                 </tr>
                                             </thead>
@@ -906,9 +824,7 @@ ${jsonExample}
                                                 {previewData.rows.map((r, ri) => (
                                                     <tr key={ri}>
                                                         {r.map((c, ci) => (
-                                                            <td key={ci} className={`${getColClass(previewData.headers[ci], false)} ${getAlignClass(previewData.headers[ci])}`}>
-                                                                {c}
-                                                            </td>
+                                                            <td key={ci} className={`${getColClass(previewData.headers[ci], false)} ${getAlignClass(previewData.headers[ci])}`}>{c}</td>
                                                         ))}
                                                     </tr>
                                                 ))}
